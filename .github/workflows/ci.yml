@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Candidate verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      has_formula: ${{ steps.candidate.outputs.has_formula }}
+      head_sha: ${{ steps.candidate.outputs.head_sha }}
+      baseline_tag: ${{ steps.candidate.outputs.baseline_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test importer and candidate guards
+        run: python3 -m unittest discover -s .github/scripts -p '*_test.py' -v
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Bind checks to the exact event head
+        id: candidate
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: python3 .github/scripts/prepare_candidate.py --expected-head "$EXPECTED_HEAD" --base-sha "$BASE_SHA"
+      - name: Verify candidate release before Ruby evaluation
+        if: steps.candidate.outputs.has_formula == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/verify_release.py --formula Formula/skuggsja.rb --evidence-dir "$RUNNER_TEMP/candidate-verification"
+
+  lifecycle:
+    name: Native lifecycle (${{ matrix.os }})
+    needs: verify
+    if: needs.verify.outputs.has_formula == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: darwin
+            arch: arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          architecture: ${{ matrix.arch }}
+      - name: Verify native runner and expose Linux Homebrew
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          node -e 'const a=require("node:assert/strict"); a.equal(process.platform,process.env.EXPECTED_PLATFORM); a.equal(process.arch,process.env.EXPECTED_ARCH); a.equal(process.env.RUNNER_ARCH, process.arch === "arm64" ? "ARM64" : "X64");'
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+            echo /home/linuxbrew/.linuxbrew/sbin >> "$GITHUB_PATH"
+          fi
+      - name: Recheck candidate head and release provenance
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ needs.verify.outputs.head_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          python3 .github/scripts/verify_release.py --formula Formula/skuggsja.rb --evidence-dir "$RUNNER_TEMP/candidate"
+      - name: Verify the older released upgrade baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_TAG: ${{ needs.verify.outputs.baseline_tag }}
+        run: python3 .github/scripts/verify_release.py --tag "$BASELINE_TAG" --evidence-dir "$RUNNER_TEMP/baseline"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 0merUfuk/skuggsja
+          ref: ${{ steps.release.outputs.source_sha }}
+          path: verified-source
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 0merUfuk/skuggsja
+          ref: ${{ steps.baseline.outputs.source_sha }}
+          path: baseline-source
+          persist-credentials: false
+      - name: Update the disposable runner's Homebrew
+        run: brew update
+      - name: Verify exact candidate installation and upgrade lifecycle
+        env:
+          EXPECTED_HEAD: ${{ needs.verify.outputs.head_sha }}
+          LIFECYCLE_MODE: ${{ github.event_name == 'pull_request' && 'candidate' || 'public' }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 .github/scripts/lifecycle.py \
+            --checkout "$GITHUB_WORKSPACE" --expected-head "$EXPECTED_HEAD" \
+            --candidate "$RUNNER_TEMP/candidate/verification.json" \
+            --baseline "$RUNNER_TEMP/baseline/verification.json" \
+            --source "$GITHUB_WORKSPACE/verified-source" \
+            --baseline-source "$GITHUB_WORKSPACE/baseline-source" \
+            --evidence-dir "$RUNNER_TEMP/lifecycle" --mode "$LIFECYCLE_MODE" \
+            --platform "$EXPECTED_PLATFORM" --arch "$EXPECTED_ARCH"
+      - name: Retain synthetic lifecycle and provenance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lifecycle-${{ matrix.os }}-${{ needs.verify.outputs.head_sha }}
+          path: |
+            ${{ runner.temp }}/lifecycle/*.json
+            ${{ runner.temp }}/lifecycle/*.stdout
+            ${{ runner.temp }}/lifecycle/*.stderr
+            ${{ runner.temp }}/candidate/verification.json
+            ${{ runner.temp }}/baseline/verification.json
+          if-no-files-found: warn
+          retention-days: 14

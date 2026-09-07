@@ -1,0 +1,61 @@
+name: Propose Skuggsja update
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Stable upstream tag (vMAJOR.MINOR.PATCH); empty selects latest stable"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: propose-skuggsja-update
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test importer guards
+    if: github.repository == '0merUfuk/homebrew-skuggsja' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 -m unittest discover -s .github/scripts -p '*_test.py' -v
+
+  propose:
+    name: Open verified formula candidate
+    needs: test
+    if: github.repository == '0merUfuk/homebrew-skuggsja' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Stage an attested release without executing Ruby or binaries
+        id: update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag || '' }}
+        run: |
+          args=(--evidence-dir "$RUNNER_TEMP/update" --current-formula Formula/skuggsja.rb)
+          if [[ -n "$REQUESTED_TAG" ]]; then args+=(--tag "$REQUESTED_TAG"); fi
+          python3 .github/scripts/update_skuggsja.py "${args[@]}"
+      - name: Create or reuse the version's candidate pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN: ${{ github.sha }}
+        run: python3 .github/scripts/propose_update.py --manifest "$RUNNER_TEMP/update/verification.json" --expected-main "$EXPECTED_MAIN"
