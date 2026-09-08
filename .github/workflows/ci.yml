@@ -82,7 +82,10 @@ jobs:
           if trust.exists():
               data=trust.read_bytes(); st=trust.stat()
               record["trust"]={"sha256":hashlib.sha256(data).hexdigest(),"mode":oct(st.st_mode&0o777),"uid":st.st_uid,"gid":st.st_gid,"bytes":data.decode()}
-          for name,args in (("prefix",["--prefix"]),("repository",["--repository"]),("command_trust",["trust","--command","--json=v1"])):
+          startup = len(sys.argv)>3 and sys.argv[3]=="startup"
+          ruby = 'require "trust"; require "json"; puts JSON.generate({trust_file: Homebrew::Trust.trust_file.to_s, user_config_home: ENV["HOMEBREW_USER_CONFIG_HOME"], user: ENV["USER"], ci: Homebrew::EnvConfig.respond_to?(:ci?) ? Homebrew::EnvConfig.ci? : nil})'
+          commands = (("actual_homebrew_startup",["ruby","-e",ruby]),) if startup else (("prefix",["--prefix"]),("repository",["--repository"]),("command_trust",["trust","--command","--json=v1"]),("external_check",["skuggsja-migrate","--check"]))
+          for name,args in commands:
               result=subprocess.run([brew,*args],capture_output=True,text=True,timeout=60)
               record[name]={"exit_code":result.returncode,"stdout":result.stdout,"stderr":result.stderr}
           print(json.dumps(record,indent=2))
@@ -110,7 +113,12 @@ jobs:
           restored = [*original, "/usr/bin/env", *restore]
           run("explicit-restored-control", [*restored, sys.executable, "-c", control])
           run("explicit-restored-context", [*restored, sys.executable, str(probe), json.dumps(keys), brew])
-          result = {"scope": "Diagnosis only; no Skuggsja package installed, no migration acceptance or trust bypass.", "candidate": candidate,
+          # Run the developer-command startup probe only after every ordinary
+          # context/external-command observation. Homebrew may enable developer
+          # mode in this disposable repository; it cannot affect those originals.
+          for label, prefix in (("baseline", []), ("original-denied", original), ("identity-preserved", preserved), ("explicit-restored", restored)):
+              run(label + "-startup", [*prefix, sys.executable, str(probe), json.dumps(keys), brew, "startup"])
+          result = {"scope": "Diagnosis only; no Skuggsja package installed, no migration acceptance or trust bypass. Final brew ruby probes may enable developer mode in the disposable Homebrew repository, after original observations.", "candidate": candidate,
                     "original_context": json.loads(observed.stdout), "baseline_context": json.loads(base.stdout)}
           (root / "diagnosis.json").write_text(json.dumps(result, indent=2) + "\n")
           print("Trust diagnostics captured; compare context files before selecting any correction.")
