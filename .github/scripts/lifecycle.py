@@ -24,6 +24,25 @@ def require(condition, message):
         raise ValueError(message)
 
 
+NETWORK_ENV_KEYS = ("HOME", "PATH", "XDG_CONFIG_HOME", "HOMEBREW_USER_CONFIG_HOME", "HOMEBREW_CACHE", "HOMEBREW_LOGS",
+                    "HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_ANALYTICS", "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_INSTALL_FROM_API")
+
+
+def linux_network_prefix(env):
+    import pwd
+    commands = [shutil.which(name) for name in ("sudo", "unshare", "setpriv")]
+    require(all(commands), "Network-denied helper verification requires sudo, unshare and setpriv")
+    require(all(key in env for key in NETWORK_ENV_KEYS), "Network isolation requires the complete private environment")
+    uid, gid = os.getuid(), os.getgid()
+    account = pwd.getpwuid(uid).pw_name
+    # Hosted sudo can overwrite XDG_CONFIG_HOME despite --preserve-env.
+    # Restore the same bounded environment after dropping privileges; never
+    # switch trust stores or loosen command trust to accommodate the wrapper.
+    return [commands[0], "-n", "--preserve-env=" + ",".join(NETWORK_ENV_KEYS), commands[1], "--net", "--",
+            commands[2], "--reuid", str(uid), "--regid", str(gid), "--init-groups", "/usr/bin/env",
+            "USER=" + account, "LOGNAME=" + account, *[key + "=" + env[key] for key in NETWORK_ENV_KEYS]]
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -75,6 +94,49 @@ def inspect_receipts(cellar, expected_tap, expected_versions):
     return result
 
 
+def migration_snapshot(prefix, cellar):
+    """Keep receipt semantics separate so only source.tap may change."""
+    receipts, files, links = {}, {}, {}
+    rack = cellar / "skuggsja"
+    for item in sorted(rack.rglob("*")):
+        relative = str(item.relative_to(rack))
+        if item.name == "INSTALL_RECEIPT.json":
+            require(item.is_file() and not item.is_symlink(), "Migration receipt must be regular")
+            receipts[item.parent.name] = {"data": json.loads(item.read_text()),
+                                          "sha256": digest(item), "mtime_ns": item.stat().st_mtime_ns,
+                                          "mode": item.stat().st_mode & 0o777}
+        elif item.is_symlink():
+            files[relative] = {"target": os.readlink(item), "mtime_ns": item.lstat().st_mtime_ns}
+        elif item.is_file():
+            files[relative] = {"sha256": digest(item), "mtime_ns": item.stat().st_mtime_ns,
+                               "mode": item.stat().st_mode & 0o777}
+        else:
+            require(item.is_dir(), "Unexpected special file in migration keg")
+            files[relative] = {"directory": True}
+    for relative in ("bin/skuggsja", "opt/skuggsja", "var/homebrew/pinned/skuggsja", *COMPLETIONS):
+        item = prefix / relative
+        links[relative] = ({"target": os.readlink(item), "mtime_ns": item.lstat().st_mtime_ns}
+                           if item.is_symlink() else {"exists": item.exists()})
+    return {"receipts": receipts, "files": files, "links": links}
+
+
+def require_tap_only_change(before, after, expected_versions):
+    require(set(before["receipts"]) == set(after["receipts"]) == set(expected_versions),
+            "Migration must retain every original keg")
+    require(before["files"] == after["files"] and before["links"] == after["links"],
+            "Migration changed non-receipt files, links or pin")
+    for version in expected_versions:
+        require(before["receipts"][version]["mode"] == after["receipts"][version]["mode"],
+                "Migration changed receipt permissions")
+        old = before["receipts"][version]["data"]
+        new = after["receipts"][version]["data"]
+        require(old["source"]["tap"] == "0merufuk/thematrix" and new["source"]["tap"] == "0merufuk/skuggsja",
+                "Migration did not update the actual old receipt origin")
+        expected = json.loads(json.dumps(old))
+        expected["source"]["tap"] = "0merufuk/skuggsja"
+        require(new == expected, "Migration changed receipt semantics beyond source.tap")
+
+
 class Lifecycle:
     def __init__(self, args):
         self.args = args
@@ -100,9 +162,9 @@ class Lifecycle:
     def save(self, name, data):
         (self.root / name).write_text(json.dumps(data, indent=2) + "\n")
 
-    def run(self, *command, allow_failure=False, cwd=None):
+    def run(self, *command, allow_failure=False, cwd=None, env=None):
         number = len(self.commands) + 1
-        result = subprocess.run(command, env=self.env, cwd=cwd or self.args.checkout,
+        result = subprocess.run(command, env=self.env if env is None else env, cwd=cwd or self.args.checkout,
                                 capture_output=True, text=True, timeout=900)
         (self.root / f"{number:03d}.stdout").write_text(result.stdout)
         (self.root / f"{number:03d}.stderr").write_text(result.stderr)
@@ -194,6 +256,141 @@ class Lifecycle:
             target = self.prefix / relative
             self.check("uninstall removes " + relative, not target.exists() and not target.is_symlink())
 
+    def migration_phase(self, candidate):
+        import fcntl
+        old_tap, new_tap = "0merUfuk/thematrix", PUBLIC_TAP
+        old_formula, new_formula = old_tap + "/skuggsja", new_tap + "/skuggsja"
+        releases = [load_release(self.args.migration_v010), load_release(self.args.migration_v011)]
+        require([r["tag"] for r in releases] == ["v0.1.0", "v0.1.1"], "Migration fixtures require both original releases")
+        checks = []
+
+        def check(label, condition):
+            require(condition, "Migration: " + label)
+            checks.append(label)
+            self.save("migration-progress.json", {"status": "in_progress", "completed_checks": checks})
+
+        def snapshot(name):
+            value = migration_snapshot(self.prefix, self.cellar)
+            self.save(name + ".json", value)
+            return value
+
+        def command(*args, failure=False):
+            result = self.run(*network_prefix, brew_binary, "skuggsja-migrate", *args, allow_failure=failure, env=helper_env)
+            if failure:
+                check("held formula lock refuses apply", result.returncode != 0)
+            data = json.loads(result.stdout)
+            return data
+
+        helper_env = dict(self.env, HOMEBREW_NO_INSTALL_FROM_API="1", HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1")
+        brew_binary = shutil.which("brew", path=helper_env["PATH"])
+        require(brew_binary is not None, "Homebrew executable missing")
+        if self.args.platform == "darwin":
+            sandbox = shutil.which("sandbox-exec")
+            require(sandbox is not None, "Network-denied helper verification requires sandbox-exec")
+            network_prefix = [sandbox, "-p", "(version 1) (allow default) (deny network*)"]
+        else:
+            network_prefix = linux_network_prefix(helper_env)
+        probe = self.run(*network_prefix, sys.executable, "-c",
+                         "import errno,socket; s=socket.socket(); s.settimeout(2); n=s.connect_ex(('198.51.100.1',443)); print(n); assert n in (errno.EPERM,errno.EACCES,errno.ENETUNREACH)", env=helper_env)
+        check("network-denial control rejects a TEST-NET connection", probe.returncode == 0)
+        self.taps = []
+        check("existing package lifecycle left no kegs", not list((self.cellar / "skuggsja").glob("*/INSTALL_RECEIPT.json")))
+        # Remove only trust granted inside this job's private configuration.
+        self.run("brew", "untrust", "--formula", new_formula)
+        self.run("brew", "untrust", "--command", new_tap + "/skuggsja-migrate")
+        remote = self.make_remote("migration-old-remote", Path(releases[0]["formula_path"]))
+        old_path = self.tap(old_tap, remote)
+        self.verify_tap(old_path, releases[0])
+        self.run("brew", "trust", "--formula", old_formula)
+        self.run("brew", "install", "--formula", old_formula)
+        shutil.copyfile(releases[1]["formula_path"], remote / "Formula/skuggsja.rb")
+        self.commit_formula(remote)
+        self.run("git", "-C", str(old_path), "pull", "--ff-only")
+        self.verify_tap(old_path, releases[1])
+        self.run("brew", "upgrade", "--formula", old_formula)
+        for release in releases:
+            binary = self.cellar / "skuggsja" / release["version"] / "bin/skuggsja"
+            check(release["version"] + " actual native binary", digest(binary) == native_archive(release, self.args.platform, self.args.arch))
+            check(release["version"] + " actual version", self.run(str(binary), "version").stdout.strip() == "skuggsja " + release["version"])
+        self.run("brew", "pin", old_formula)
+        check("two authentic old-origin kegs retained", len(inspect_receipts(self.cellar, old_tap, ["0.1.0", "0.1.1"])) == 2)
+        check("test-created pin exists", (self.prefix / "var/homebrew/pinned/skuggsja").is_symlink())
+        before = snapshot("migration-before-update")
+        (remote / "Formula/skuggsja.rb").unlink()
+        (remote / "tap_migrations.json").write_text(json.dumps({"skuggsja": new_tap}) + "\n")
+        self.run("git", "-C", str(remote), "add", "--all")
+        self.run("git", "-C", str(remote), "-c", "user.name=Synthetic packaging CI", "-c", "user.email=synthetic@example.invalid",
+                 "commit", "-m", "Move synthetic old formula to the dedicated tap")
+        cutover = self.run("git", "-C", str(remote), "rev-parse", "HEAD").stdout.strip()
+        update = self.run("brew", "update", "--force", "--verbose")
+        check("real update fetched fixture cutover", self.run("git", "-C", str(old_path), "rev-parse", "HEAD").stdout.strip() == cutover)
+        check("untrusted absent destination is refused", "Not automatically tapping 0merufuk/skuggsja" in update.stdout + update.stderr)
+        check("refusal preserves both pinned kegs", snapshot("migration-after-refusal") == before)
+        destination = self.tap(new_tap)
+        # Keep the real canonical origin; fetch the exact PR object, never copy
+        # an unverified working tree over an older remote-main checkout.
+        self.run("git", "-C", str(destination), "fetch", "--no-tags", "origin", self.args.expected_head)
+        self.run("git", "-C", str(destination), "checkout", "--detach", self.args.expected_head)
+        self.verify_tap(destination, candidate, self.args.expected_head)
+        for relative in ("cmd/skuggsja-migrate.rb", "libexec/migration_helper.rb", "libexec/migration-releases.json"):
+            check(relative + " is exact candidate source", digest(destination / relative) == digest(self.args.checkout / relative))
+        self.run("brew", "trust", "--formula", new_formula)
+        self.run("brew", "trust", "--command", new_tap + "/skuggsja-migrate")
+        expected_trust = json.loads(self.run(brew_binary, "trust", "--command", "--json=v1", env=helper_env).stdout)
+        isolated_trust = json.loads(self.run(*network_prefix, brew_binary, "trust", "--command", "--json=v1", env=helper_env).stdout)
+        check("network-denied context preserves the exact canonical command trust", isinstance(expected_trust, list) and
+              new_tap.lower() + "/skuggsja-migrate" in expected_trust and isolated_trust == expected_trust)
+        default = command()
+        check("default command reports both planned receipt changes", default["status"] == "ready" and
+              set(default["would_change_versions"]) == {"0.1.0", "0.1.1"} and default["changed_versions"] == [])
+        check("default command does not write", snapshot("migration-after-default-check") == before)
+        explicit = command("--check")
+        check("explicit check reports ready", explicit["status"] == "ready" and explicit["changed_versions"] == [])
+        check("explicit check does not write", snapshot("migration-after-explicit-check") == before)
+        lock = self.prefix / "var/homebrew/locks/skuggsja.formula.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with lock.open("a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            denied = command("--apply", failure=True)
+            check("lock failure is explicit", denied["status"] == "failed" and denied["changed_versions"] == [])
+            check("lock refusal does not write", snapshot("migration-after-lock-refusal") == before)
+        applied = command("--apply")
+        check("apply reports both changed versions", applied["status"] == "migrated" and set(applied["changed_versions"]) == {"0.1.0", "0.1.1"})
+        check("apply retains a backup directory", isinstance(applied["backup_directory"], str) and Path(applied["backup_directory"]).is_dir())
+        after = snapshot("migration-after-apply")
+        require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+        check("all receipt semantics except source.tap and all other keg files/links/pin preserved", True)
+        repeated = command("--apply")
+        check("repeated apply is idempotent", repeated["status"] == "up_to_date" and repeated["changed_versions"] == [])
+        check("idempotent apply does not rewrite receipts", snapshot("migration-after-idempotent-apply") == after)
+        self.run("brew", "unpin", new_formula)
+        check("only the test-created pin was removed", not (self.prefix / "var/homebrew/pinned/skuggsja").exists())
+        self.run("brew", "trust", "--formula", new_formula)
+        self.run("brew", "reinstall", "--formula", new_formula)
+        expected_versions = ["0.1.0", candidate["version"]]
+        check("qualified reinstall retains correct origin for every remaining keg", len(inspect_receipts(self.cellar, new_tap, expected_versions)) == len(set(expected_versions)))
+        binary = self.cellar / "skuggsja" / candidate["version"] / "bin/skuggsja"
+        check("reinstalled current binary remains attested", digest(binary) == native_archive(candidate, self.args.platform, self.args.arch))
+        for relative in ("bin/skuggsja", *COMPLETIONS):
+            check("reinstalled linked " + relative, (self.prefix / relative).resolve() == (binary.parent.parent / relative).resolve())
+        self.run("brew", "test", "--verbose", new_formula)
+        smoke = self.run("node", str(self.args.source / "scripts/verify-install.cjs"), str(binary), candidate["version"])
+        match = re.search(r"Installed CLI smoke: ([1-9][0-9]*)/\1 checks passed", smoke.stdout)
+        check("exact-source synthetic installed CLI passes after recovery", match is not None)
+        self.run("brew", "uninstall", "--force", "--formula", new_formula)
+        check("migration fixture cleanup removes all kegs", not list((self.cellar / "skuggsja").glob("*/INSTALL_RECEIPT.json")))
+        for tap in reversed(self.taps):
+            self.run("brew", "untrust", "--formula", tap + "/skuggsja")
+            if tap == new_tap:
+                self.run("brew", "untrust", "--command", tap + "/skuggsja-migrate")
+            self.run("brew", "untap", tap)
+        self.check_state()
+        self.save("migration-result.json", {"status": "passed", "passed": len(checks), "checks": checks,
+                  "synthetic_cli_checks": int(match.group(1)), "candidate_head": self.args.expected_head,
+                  "versions_before": ["0.1.0", "0.1.1"], "versions_after_reinstall": expected_versions,
+                  "scope": "Separate native explicit receipt recovery after real untrusted migration refusal; both retained kegs and pin preserved. Earlier reinstall failure evidence remains unchanged."})
+        print(f"Native migration recovery: {len(checks)} checks passed; separate from package lifecycle")
+
     def execute(self):
         candidate, baseline = load_release(self.args.candidate), load_release(self.args.baseline)
         require(stable_version(baseline["version"]) < stable_version(candidate["version"]), "Upgrade must cross real versions")
@@ -259,6 +456,8 @@ class Lifecycle:
                   "platform": self.args.platform, "arch": self.args.arch,
                   "scope": "Actual fresh install, real version upgrade, retained keg receipts, reinstall/uninstall and synthetic CLI. Tap migration is separate."})
         print(f"Native lifecycle: {len(self.checks)} checks passed; {self.args.mode}; real {baseline['version']} -> {candidate['version']} upgrade")
+        if self.args.verify_migration:
+            self.migration_phase(candidate)
 
 
 def main():
@@ -269,7 +468,12 @@ def main():
     parser.add_argument("--mode", choices=("candidate", "public"), required=True)
     parser.add_argument("--platform", choices=("darwin", "linux"), required=True)
     parser.add_argument("--arch", choices=("arm64", "x64"), required=True)
+    parser.add_argument("--verify-migration", action="store_true")
+    parser.add_argument("--migration-v010", type=Path)
+    parser.add_argument("--migration-v011", type=Path)
     args = parser.parse_args()
+    if args.verify_migration and (args.migration_v010 is None or args.migration_v011 is None):
+        parser.error("--verify-migration requires both --migration-v010 and --migration-v011")
     lifecycle = Lifecycle(args)
     try:
         lifecycle.execute()

@@ -5,13 +5,17 @@ import hashlib
 import io
 import json
 import os
+import pwd
+import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from lifecycle import Lifecycle, inspect_receipts, load_release, native_archive, stable_version
+from lifecycle import (Lifecycle, inspect_receipts, load_release, native_archive, stable_version,
+                       migration_snapshot, require_tap_only_change, linux_network_prefix, NETWORK_ENV_KEYS)
 
 
 class LifecycleGuards(unittest.TestCase):
@@ -179,6 +183,84 @@ class LifecycleGuards(unittest.TestCase):
             check = Lifecycle(args)
         self.assertFalse(set(env) & {"GH_TOKEN", "GITHUB_TOKEN", "HOMEBREW_GITHUB_API_TOKEN"} & set(check.env))
         self.assertEqual(Path(check.env["HOMEBREW_USER_CONFIG_HOME"]).parent, args.evidence_dir.resolve())
+
+    def test_linux_namespace_restores_private_environment_after_uid_drop(self):
+        original = {key: str(self.root / key) for key in NETWORK_ENV_KEYS}
+        original.update(HOME=os.environ["HOME"], PATH=os.environ["PATH"],
+                        HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_INSTALL_FROM_API="1", HOMEBREW_NO_ANALYTICS="1",
+                        USER="untrusted-inherited-name", GH_TOKEN="synthetic-secret")
+        with patch("lifecycle.shutil.which", side_effect=lambda name: "/synthetic/bin/" + name):
+            prefix = linux_network_prefix(original)
+        env_index = prefix.index("/usr/bin/env")
+        self.assertEqual(prefix[3:7], ["/synthetic/bin/unshare", "--net", "--", "/synthetic/bin/setpriv"])
+        self.assertEqual(prefix[7:env_index], ["--reuid", str(os.getuid()), "--regid", str(os.getgid()), "--init-groups"])
+        self.assertFalse(any("synthetic-secret" in argument or argument.startswith("GH_TOKEN=") for argument in prefix))
+        # Reproduce the measured sudo damage without invoking sudo or Homebrew.
+        corrupted = dict(os.environ, XDG_CONFIG_HOME="/synthetic/wrong-config", USER="root", LOGNAME="root")
+        script = "import json,os; print(json.dumps({k:os.environ.get(k) for k in " + repr(list(NETWORK_ENV_KEYS) + ["USER", "LOGNAME"]) + "}))"
+        result = subprocess.run([*prefix[env_index:], sys.executable, "-c", script], env=corrupted,
+                                capture_output=True, text=True, check=True)
+        actual = json.loads(result.stdout)
+        for key in NETWORK_ENV_KEYS:
+            self.assertEqual(actual[key], original[key], key)
+        self.assertEqual(actual["USER"], pwd.getpwuid(os.getuid()).pw_name)
+        self.assertEqual(actual["LOGNAME"], actual["USER"])
+
+    def test_linux_namespace_rejects_missing_private_config(self):
+        original = {key: "synthetic" for key in NETWORK_ENV_KEYS if key != "XDG_CONFIG_HOME"}
+        with patch("lifecycle.shutil.which", side_effect=lambda name: "/synthetic/bin/" + name):
+            with self.assertRaisesRegex(ValueError, "complete private environment"):
+                linux_network_prefix(original)
+
+    def migration_pair(self):
+        cellar = self.root / "Cellar"
+        for version in ("0.1.0", "0.1.1"):
+            keg = cellar / "skuggsja" / version
+            (keg / "bin").mkdir(parents=True)
+            (keg / "bin/skuggsja").write_text("synthetic executable " + version)
+            (keg / "INSTALL_RECEIPT.json").write_text(json.dumps({"source": {"tap": "0merufuk/thematrix", "path": "synthetic/formula.rb"}, "options": ["synthetic-option"]}))
+        pin = self.root / "var/homebrew/pinned/skuggsja"
+        pin.parent.mkdir(parents=True)
+        pin.symlink_to(cellar / "skuggsja/0.1.1")
+        before = migration_snapshot(self.root, cellar)
+        after = json.loads(json.dumps(before))
+        for entry in after["receipts"].values():
+            entry["data"]["source"]["tap"] = "0merufuk/skuggsja"
+            entry["sha256"] = "new-receipt-bytes"
+            entry["mtime_ns"] += 1
+        return before, after
+
+    def test_migration_allows_only_actual_origin_change_for_both_retained_kegs(self):
+        before, after = self.migration_pair()
+        require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_rewriting_other_receipt_metadata(self):
+        before, after = self.migration_pair()
+        after["receipts"]["0.1.0"]["data"]["source"]["path"] = "different/formula.rb"
+        with self.assertRaisesRegex(ValueError, "semantics"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_missing_retained_keg(self):
+        before, after = self.migration_pair()
+        del after["receipts"]["0.1.0"]
+        with self.assertRaisesRegex(ValueError, "every original keg"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_changed_receipt_permissions(self):
+        before, after = self.migration_pair()
+        after["receipts"]["0.1.0"]["mode"] = before["receipts"]["0.1.0"]["mode"] ^ 0o100
+        with self.assertRaisesRegex(ValueError, "receipt permissions"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_binary_or_pin_mutation(self):
+        before, after = self.migration_pair()
+        after["files"]["0.1.0/bin/skuggsja"]["mtime_ns"] += 1
+        with self.assertRaisesRegex(ValueError, "non-receipt"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+        after["files"] = json.loads(json.dumps(before["files"]))
+        after["links"]["var/homebrew/pinned/skuggsja"]["target"] = "other-keg"
+        with self.assertRaisesRegex(ValueError, "non-receipt"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
 
 
 if __name__ == "__main__":
