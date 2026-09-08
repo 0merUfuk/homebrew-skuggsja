@@ -99,7 +99,8 @@ module SkuggsjaMigration
       directory!(@new_tap)
       mapping = snapshot(@old_tap/"tap_migrations.json", bytes: true, limit: 65536)
       map = parse_json(mapping[:bytes], "local tap migration map")
-      unless map.is_a?(Hash) && map["skuggsja"]&.downcase == NEW_TAP
+      target = map["skuggsja"] if map.is_a?(Hash)
+      unless target.is_a?(String) && target.downcase == NEW_TAP
         raise Error, "Installed old tap must map skuggsja exactly to #{NEW_TAP}"
       end
       manifest = snapshot(@manifest_path, bytes: true, limit: 65536)

@@ -2,6 +2,7 @@
 
 # Standalone offline tests: synthetic bytes, a fake Tab, no Homebrew subprocess.
 require "json"
+require "open3"
 require "tmpdir"
 require_relative "migration_helper"
 
@@ -248,6 +249,16 @@ module MigrationTests
     reject(/map skuggsja exactly/) { f.repair.run(apply: true) }
   end
 
+  test("non-string migration targets produce a domain error before writes") do |f|
+    f.add("0.1.1")
+    [23, ["0merUfuk/skuggsja"]].each do |target|
+      (f.old_tap/"tap_migrations.json").write(JSON.generate("skuggsja" => target))
+      before = f.snapshots
+      reject(/Installed old tap must map skuggsja exactly/) { f.repair.run(apply: true) }
+      assert(f.snapshots == before)
+    end
+  end
+
   test("missing installed destination rejects") do |f|
     f.new_tap.rmdir
     reject(/No such file|non-directory/) { f.repair.run(apply: true) }
@@ -315,6 +326,46 @@ module MigrationTests
     f.add("0.1.1"); data = JSON.parse(f.manifest.read); data["releases"][0] = data["releases"][1]
     f.manifest.write(JSON.generate(data))
     reject(/Duplicate release/) { f.repair.run(apply: true) }
+  end
+
+  test("local Git preserves non-ASCII bytes and never fetches missing promisor objects") do |f|
+    command_path = Pathname(__dir__).parent/"cmd/skuggsja-migrate.rb"
+    source = command_path.read
+    methods = source.scan(/^      def local_git\(tap, \*args\)\n.*?^      end$/m)
+    assert(methods.length == 1, "Expected exactly one local_git command method")
+    command = Class.new
+    command.class_eval(methods.first, command_path.to_s)
+    git_environment = { "GIT_CONFIG_NOSYSTEM" => "1", "GIT_CONFIG_GLOBAL" => File::NULL,
+                        "GIT_NO_LAZY_FETCH" => "0" }
+    git = lambda do |*args|
+      output, error, status = Open3.capture3(git_environment, "git", *args, binmode: true)
+      assert(status.success?, "Synthetic Git setup failed: #{error}")
+      output
+    end
+    origin = f.root/"promisor-origin"
+    clone = f.root/"promisor-clone"
+    git.call("init", "--quiet", "--template=", origin.to_s)
+    content = "local-only promisor regression fixture — skuggsjá\n".b
+    (origin/"formula.txt").write(content)
+    git.call("-C", origin.to_s, "add", "formula.txt")
+    git.call("-C", origin.to_s, "-c", "user.name=Synthetic Test", "-c", "user.email=test@example.invalid",
+             "-c", "core.hooksPath=#{File::NULL}", "commit", "--quiet", "--no-gpg-sign", "-m", "Fixture")
+    oid = git.call("-C", origin.to_s, "rev-parse", "HEAD:formula.txt").strip
+    git.call("clone", "--quiet", "--no-hardlinks", origin.to_s, clone.to_s)
+    git.call("-C", clone.to_s, "config", "remote.origin.promisor", "true")
+    git.call("-C", clone.to_s, "config", "extensions.partialClone", "origin")
+    git.call("-C", clone.to_s, "config", "protocol.allow", "never")
+    git.call("-C", clone.to_s, "config", "protocol.file.allow", "always")
+    tap = Struct.new(:path).new(clone)
+    assert(command.new.send(:local_git, tap, "cat-file", "blob", oid) == content)
+    object = clone/".git/objects"/oid[0, 2]/oid[2..]
+    assert(object.file?, "Expected an independently copied loose fixture blob")
+    object.unlink
+    reject(/Cannot verify destination/) { command.new.send(:local_git, tap, "cat-file", "blob", oid) }
+    assert(!object.exist?, "Offline identity check restored a missing object")
+    # Positive control: the same missing blob is obtainable through the owned
+    # local file remote when lazy fetch is enabled. Other protocols are denied.
+    assert(git.call("-C", clone.to_s, "cat-file", "blob", oid) == content)
   end
 
   puts JSON.pretty_generate(status: "PASS", tests: @passed.length, passed: @passed.length,

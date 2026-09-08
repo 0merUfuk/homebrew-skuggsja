@@ -49,8 +49,8 @@ module Homebrew
       private
 
       def local_git(tap, *args)
-        output, _error, status = Open3.capture3({ "GIT_NO_REPLACE_OBJECTS" => "1" },
-                                              "git", "-C", tap.path.to_s, *args)
+        output, _error, status = Open3.capture3({ "GIT_NO_REPLACE_OBJECTS" => "1", "GIT_NO_LAZY_FETCH" => "1" },
+                                              "git", "-C", tap.path.to_s, *args, binmode: true)
         raise SkuggsjaMigration::Error, "Cannot verify destination tap's committed local formula" unless status.success?
         output
       end
