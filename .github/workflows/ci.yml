@@ -1,80 +1,16 @@
-name: CI
+name: Homebrew isolation diagnosis
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  verify:
-    name: Candidate verification
+  diagnose:
+    name: Diagnose Linux trust under network denial
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    outputs:
-      has_formula: ${{ steps.candidate.outputs.has_formula }}
-      head_sha: ${{ steps.candidate.outputs.head_sha }}
-      baseline_tag: ${{ steps.candidate.outputs.baseline_tag }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Test importer and candidate guards
-        run: python3 -m unittest discover -s .github/scripts -p '*_test.py' -v
-      - name: Test explicit receipt migration guards
-        env:
-          HOMEBREW_NO_ANALYTICS: "1"
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: |
-          brew_repository=$(/home/linuxbrew/.linuxbrew/bin/brew --repository)
-          ruby_binary="$brew_repository/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"
-          "$ruby_binary" --version
-          "$ruby_binary" libexec/migration_test.rb
-      - name: Validate workflow syntax
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
-      - name: Bind checks to the exact event head
-        id: candidate
-        env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-        run: python3 .github/scripts/prepare_candidate.py --expected-head "$EXPECTED_HEAD" --base-sha "$BASE_SHA"
-      - name: Verify candidate release before Ruby evaluation
-        if: steps.candidate.outputs.has_formula == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/verify_release.py --formula Formula/skuggsja.rb --evidence-dir "$RUNNER_TEMP/candidate-verification"
-
-  lifecycle:
-    name: Native lifecycle (${{ matrix.os }})
-    needs: verify
-    if: needs.verify.outputs.has_formula == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            platform: darwin
-            arch: arm64
-          - os: macos-15-intel
-            platform: darwin
-            arch: x64
-          - os: ubuntu-24.04
-            platform: linux
-            arch: x64
-          - os: ubuntu-24.04-arm
-            platform: linux
-            arch: arm64
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -85,103 +21,108 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify.outputs.head_sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22.23.1
-          architecture: ${{ matrix.arch }}
-      - name: Verify native runner and expose Linux Homebrew
-        env:
-          EXPECTED_PLATFORM: ${{ matrix.platform }}
-          EXPECTED_ARCH: ${{ matrix.arch }}
-        run: |
-          node -e 'const a=require("node:assert/strict"); a.equal(process.platform,process.env.EXPECTED_PLATFORM); a.equal(process.arch,process.env.EXPECTED_ARCH); a.equal(process.env.RUNNER_ARCH, process.arch === "arm64" ? "ARM64" : "X64");'
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
-            echo /home/linuxbrew/.linuxbrew/sbin >> "$GITHUB_PATH"
-          fi
-      - name: Recheck candidate head and release provenance
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_HEAD: ${{ needs.verify.outputs.head_sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          python3 .github/scripts/verify_release.py --formula Formula/skuggsja.rb --evidence-dir "$RUNNER_TEMP/candidate"
-      - name: Verify the older released upgrade baseline
-        id: baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASELINE_TAG: ${{ needs.verify.outputs.baseline_tag }}
-        run: python3 .github/scripts/verify_release.py --tag "$BASELINE_TAG" --evidence-dir "$RUNNER_TEMP/baseline"
-      - name: Bind the two original migration fixtures to verified releases
-        id: migration
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys
-          root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          for tag, key in (("v0.1.0", "v010"), ("v0.1.1", "v011")):
-              selected = None
-              for name in ("candidate", "baseline"):
-                  path = root / name / "verification.json"
-                  if json.loads(path.read_text())["tag"] == tag:
-                      selected = path
-                      break
-              if selected is None:
-                  output = root / ("migration-" + tag)
-                  subprocess.run([sys.executable, ".github/scripts/verify_release.py", "--tag", tag,
-                                  "--evidence-dir", str(output)], check=True)
-                  selected = output / "verification.json"
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-                  stream.write(f"{key}={selected}\n")
-          PY
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 0merUfuk/skuggsja
-          ref: ${{ steps.release.outputs.source_sha }}
-          path: verified-source
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: 0merUfuk/skuggsja
-          ref: ${{ steps.baseline.outputs.source_sha }}
-          path: baseline-source
-          persist-credentials: false
+      - name: Expose the disposable runner's Homebrew
+        run: echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
       - name: Update the disposable runner's Homebrew
         run: brew update
-      - name: Verify exact candidate installation and upgrade lifecycle
-        env:
-          EXPECTED_HEAD: ${{ needs.verify.outputs.head_sha }}
-          LIFECYCLE_MODE: ${{ github.event_name == 'pull_request' && 'candidate' || 'public' }}
-          EXPECTED_PLATFORM: ${{ matrix.platform }}
-          EXPECTED_ARCH: ${{ matrix.arch }}
-          MIGRATION_V010: ${{ steps.migration.outputs.v010 }}
-          MIGRATION_V011: ${{ steps.migration.outputs.v011 }}
+      - name: Compare explicit command trust in isolated contexts
         run: |
-          python3 .github/scripts/lifecycle.py \
-            --checkout "$GITHUB_WORKSPACE" --expected-head "$EXPECTED_HEAD" \
-            --candidate "$RUNNER_TEMP/candidate/verification.json" \
-            --baseline "$RUNNER_TEMP/baseline/verification.json" \
-            --source "$GITHUB_WORKSPACE/verified-source" \
-            --baseline-source "$GITHUB_WORKSPACE/baseline-source" \
-            --evidence-dir "$RUNNER_TEMP/lifecycle" --mode "$LIFECYCLE_MODE" \
-            --platform "$EXPECTED_PLATFORM" --arch "$EXPECTED_ARCH" \
-            --verify-migration --migration-v010 "$MIGRATION_V010" --migration-v011 "$MIGRATION_V011"
-      - name: Retain synthetic lifecycle and provenance evidence
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, pwd, shutil, subprocess, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "trust-diagnosis"
+          root.mkdir(mode=0o700)
+          os.umask(0o077)
+          env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN", "HOMEBREW_GITHUB_API_TOKEN"}}
+          for key, name in (("HOMEBREW_USER_CONFIG_HOME", "brew-config"), ("XDG_CONFIG_HOME", "xdg-config"),
+                            ("HOMEBREW_CACHE", "brew-cache"), ("HOMEBREW_LOGS", "brew-logs")):
+              env[key] = str(root / name)
+              pathlib.Path(env[key]).mkdir(mode=0o700)
+          env.update(HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_INSTALL_FROM_API="1", HOMEBREW_NO_ANALYTICS="1")
+          records = []
+          def run(label, argv, run_env=env, required=True):
+              result = subprocess.run(argv, env=run_env, text=True, capture_output=True, timeout=180)
+              (root / (label + ".stdout")).write_text(result.stdout)
+              (root / (label + ".stderr")).write_text(result.stderr)
+              records.append({"label": label, "argv": argv, "exit_code": result.returncode})
+              (root / "commands.json").write_text(json.dumps(records, indent=2) + "\n")
+              if required and result.returncode:
+                  raise RuntimeError("Diagnostic command failed: " + label)
+              return result
+          brew = shutil.which("brew", path=env["PATH"])
+          assert brew is not None
+          repo = pathlib.Path(run("brew-repository", [brew, "--repository"]).stdout.strip())
+          run("brew-version", [brew, "--version"])
+          run("brew-source-head", ["git", "-C", str(repo), "rev-parse", "HEAD"])
+          destination = repo / "Library/Taps/0merufuk/homebrew-skuggsja"
+          assert not destination.exists(), "Fresh diagnostic runner unexpectedly already has the destination tap"
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          run("clone-canonical-tap", ["git", "clone", "--no-hardlinks", "https://github.com/0merUfuk/homebrew-skuggsja", str(destination)])
+          candidate = "546cf69e5e1c05819ac09aae4d28578286524281"
+          run("fetch-exact-candidate", ["git", "-C", str(destination), "fetch", "--no-tags", "origin", candidate])
+          run("checkout-exact-candidate", ["git", "-C", str(destination), "checkout", "--detach", candidate])
+          assert run("candidate-head", ["git", "-C", str(destination), "rev-parse", "HEAD"]).stdout.strip() == candidate
+          command = "0merUfuk/skuggsja/skuggsja-migrate"
+          run("trust-only-command", [brew, "trust", "--command", command])
+          keys = ["USER", "LOGNAME", "HOME", "XDG_CONFIG_HOME", "HOMEBREW_XDG_CONFIG_HOME", "HOMEBREW_USER_CONFIG_HOME",
+                  "HOMEBREW_FORCE_BREW_WRAPPER", "HOMEBREW_ORIGINAL_BREW_FILE", "HOMEBREW_BREW_FILE",
+                  "HOMEBREW_REPOSITORY", "HOMEBREW_PREFIX", "HOMEBREW_SUDO_USER", "SUDO_USER", "SUDO_UID", "SUDO_GID",
+                  "CI", "GITHUB_ACTIONS", "HOMEBREW_CI", "HOMEBREW_REQUIRE_TAP_TRUST", "HOMEBREW_NO_REQUIRE_TAP_TRUST",
+                  "HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_INSTALL_FROM_API", "HOMEBREW_NO_ANALYTICS"]
+          probe = root / "context.py"
+          probe.write_text('''import hashlib,json,os,pathlib,pwd,subprocess,sys
+          keys=json.loads(sys.argv[1]); brew=sys.argv[2]
+          record={"uid":os.getuid(),"euid":os.geteuid(),"gid":os.getgid(),"groups":os.getgroups(),"account":pwd.getpwuid(os.getuid()).pw_name,"env":{k:os.environ.get(k) for k in keys},"brew":brew,"brew_realpath":str(pathlib.Path(brew).resolve())}
+          xdg=os.environ.get("XDG_CONFIG_HOME") or os.environ.get("HOMEBREW_XDG_CONFIG_HOME")
+          config=pathlib.Path(xdg)/"homebrew" if xdg else pathlib.Path(os.environ["HOME"])/".homebrew"
+          trust=config/"trust.json"
+          record["derived_config_directory"]=str(config)
+          record["trust_path"]=str(trust)
+          record["trust_exists"]=trust.exists()
+          if trust.exists():
+              data=trust.read_bytes(); st=trust.stat()
+              record["trust"]={"sha256":hashlib.sha256(data).hexdigest(),"mode":oct(st.st_mode&0o777),"uid":st.st_uid,"gid":st.st_gid,"bytes":data.decode()}
+          for name,args in (("prefix",["--prefix"]),("repository",["--repository"]),("command_trust",["trust","--command","--json=v1"])):
+              result=subprocess.run([brew,*args],capture_output=True,text=True,timeout=60)
+              record[name]={"exit_code":result.returncode,"stdout":result.stdout,"stderr":result.stderr}
+          print(json.dumps(record,indent=2))
+          ''')
+          kept = ["HOME", "PATH", "XDG_CONFIG_HOME", "HOMEBREW_USER_CONFIG_HOME", "HOMEBREW_CACHE", "HOMEBREW_LOGS",
+                  "HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_ANALYTICS", "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_INSTALL_FROM_API"]
+          sudo, unshare, setpriv = [shutil.which(n) for n in ("sudo", "unshare", "setpriv")]
+          assert all((sudo, unshare, setpriv))
+          original = [sudo, "-n", "--preserve-env=" + ",".join(kept), unshare, "--net", "--", setpriv,
+                      "--reuid", str(os.getuid()), "--regid", str(os.getgid()), "--init-groups"]
+          control = "import errno,socket; s=socket.socket(); s.settimeout(2); n=s.connect_ex(('198.51.100.1',443)); print(n); assert n in (errno.EPERM,errno.EACCES,errno.ENETUNREACH)"
+          run("network-denial-control", [*original, sys.executable, "-c", control])
+          base = run("baseline-context", [sys.executable, str(probe), json.dumps(keys), brew])
+          # The first namespace uses exactly the failed lifecycle wrapper.
+          observed = run("original-denied-context", [*original, sys.executable, str(probe), json.dumps(keys), brew])
+          # Variants change only inherited identity/config values, keeping the
+          # same UID drop, network namespace and command-scoped trust decision.
+          identities = ["USER", "LOGNAME", "HOMEBREW_XDG_CONFIG_HOME"]
+          preserved = original.copy()
+          preserved[2] = "--preserve-env=" + ",".join(kept + identities)
+          run("identity-preserved-control", [*preserved, sys.executable, "-c", control])
+          run("identity-preserved-context", [*preserved, sys.executable, str(probe), json.dumps(keys), brew])
+          restore = ["USER=" + pwd.getpwuid(os.getuid()).pw_name, "LOGNAME=" + pwd.getpwuid(os.getuid()).pw_name]
+          restore += [k + "=" + env[k] for k in kept if k in env]
+          restored = [*original, "/usr/bin/env", *restore]
+          run("explicit-restored-control", [*restored, sys.executable, "-c", control])
+          run("explicit-restored-context", [*restored, sys.executable, str(probe), json.dumps(keys), brew])
+          result = {"scope": "Diagnosis only; no Skuggsja package installed, no migration acceptance or trust bypass.", "candidate": candidate,
+                    "original_context": json.loads(observed.stdout), "baseline_context": json.loads(base.stdout)}
+          (root / "diagnosis.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("Trust diagnostics captured; compare context files before selecting any correction.")
+          PY
+      - name: Retain bounded trust diagnosis
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: lifecycle-${{ matrix.os }}-${{ needs.verify.outputs.head_sha }}
+          name: linux-trust-diagnosis-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/lifecycle/*.json
-            ${{ runner.temp }}/lifecycle/*.stdout
-            ${{ runner.temp }}/lifecycle/*.stderr
-            ${{ runner.temp }}/candidate/verification.json
-            ${{ runner.temp }}/baseline/verification.json
-            ${{ runner.temp }}/migration-v*/verification.json
-          if-no-files-found: warn
+            ${{ runner.temp }}/trust-diagnosis/*.json
+            ${{ runner.temp }}/trust-diagnosis/*.stdout
+            ${{ runner.temp }}/trust-diagnosis/*.stderr
+          if-no-files-found: error
           retention-days: 14
