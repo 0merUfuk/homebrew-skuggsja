@@ -24,6 +24,25 @@ def require(condition, message):
         raise ValueError(message)
 
 
+NETWORK_ENV_KEYS = ("HOME", "PATH", "XDG_CONFIG_HOME", "HOMEBREW_USER_CONFIG_HOME", "HOMEBREW_CACHE", "HOMEBREW_LOGS",
+                    "HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_ANALYTICS", "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_INSTALL_FROM_API")
+
+
+def linux_network_prefix(env):
+    import pwd
+    commands = [shutil.which(name) for name in ("sudo", "unshare", "setpriv")]
+    require(all(commands), "Network-denied helper verification requires sudo, unshare and setpriv")
+    require(all(key in env for key in NETWORK_ENV_KEYS), "Network isolation requires the complete private environment")
+    uid, gid = os.getuid(), os.getgid()
+    account = pwd.getpwuid(uid).pw_name
+    # Hosted sudo can overwrite XDG_CONFIG_HOME despite --preserve-env.
+    # Restore the same bounded environment after dropping privileges; never
+    # switch trust stores or loosen command trust to accommodate the wrapper.
+    return [commands[0], "-n", "--preserve-env=" + ",".join(NETWORK_ENV_KEYS), commands[1], "--net", "--",
+            commands[2], "--reuid", str(uid), "--regid", str(gid), "--init-groups", "/usr/bin/env",
+            "USER=" + account, "LOGNAME=" + account, *[key + "=" + env[key] for key in NETWORK_ENV_KEYS]]
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -270,12 +289,7 @@ class Lifecycle:
             require(sandbox is not None, "Network-denied helper verification requires sandbox-exec")
             network_prefix = [sandbox, "-p", "(version 1) (allow default) (deny network*)"]
         else:
-            commands = [shutil.which(name) for name in ("sudo", "unshare", "setpriv")]
-            require(all(commands), "Network-denied helper verification requires sudo, unshare and setpriv")
-            kept = ["HOME", "PATH", "XDG_CONFIG_HOME", "HOMEBREW_USER_CONFIG_HOME", "HOMEBREW_CACHE", "HOMEBREW_LOGS",
-                    "HOMEBREW_NO_AUTO_UPDATE", "HOMEBREW_NO_ANALYTICS", "HOMEBREW_NO_INSTALL_CLEANUP", "HOMEBREW_NO_INSTALL_FROM_API"]
-            network_prefix = [commands[0], "-n", "--preserve-env=" + ",".join(kept), commands[1], "--net", "--",
-                              commands[2], "--reuid", str(os.getuid()), "--regid", str(os.getgid()), "--init-groups"]
+            network_prefix = linux_network_prefix(helper_env)
         probe = self.run(*network_prefix, sys.executable, "-c",
                          "import errno,socket; s=socket.socket(); s.settimeout(2); n=s.connect_ex(('198.51.100.1',443)); print(n); assert n in (errno.EPERM,errno.EACCES,errno.ENETUNREACH)", env=helper_env)
         check("network-denial control rejects a TEST-NET connection", probe.returncode == 0)
@@ -322,6 +336,10 @@ class Lifecycle:
             check(relative + " is exact candidate source", digest(destination / relative) == digest(self.args.checkout / relative))
         self.run("brew", "trust", "--formula", new_formula)
         self.run("brew", "trust", "--command", new_tap + "/skuggsja-migrate")
+        expected_trust = json.loads(self.run(brew_binary, "trust", "--command", "--json=v1", env=helper_env).stdout)
+        isolated_trust = json.loads(self.run(*network_prefix, brew_binary, "trust", "--command", "--json=v1", env=helper_env).stdout)
+        check("network-denied context preserves the exact canonical command trust", isinstance(expected_trust, list) and
+              new_tap.lower() + "/skuggsja-migrate" in expected_trust and isolated_trust == expected_trust)
         default = command()
         check("default command reports both planned receipt changes", default["status"] == "ready" and
               set(default["would_change_versions"]) == {"0.1.0", "0.1.1"} and default["changed_versions"] == [])
