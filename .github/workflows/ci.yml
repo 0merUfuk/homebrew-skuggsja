@@ -30,6 +30,15 @@ jobs:
           persist-credentials: false
       - name: Test importer and candidate guards
         run: python3 -m unittest discover -s .github/scripts -p '*_test.py' -v
+      - name: Test explicit receipt migration guards
+        env:
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew_repository=$(/home/linuxbrew/.linuxbrew/bin/brew --repository)
+          ruby_binary="$brew_repository/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"
+          "$ruby_binary" --version
+          "$ruby_binary" libexec/migration_test.rb
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
       - name: Bind checks to the exact event head
@@ -107,6 +116,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASELINE_TAG: ${{ needs.verify.outputs.baseline_tag }}
         run: python3 .github/scripts/verify_release.py --tag "$BASELINE_TAG" --evidence-dir "$RUNNER_TEMP/baseline"
+      - name: Bind the two original migration fixtures to verified releases
+        id: migration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          for tag, key in (("v0.1.0", "v010"), ("v0.1.1", "v011")):
+              selected = None
+              for name in ("candidate", "baseline"):
+                  path = root / name / "verification.json"
+                  if json.loads(path.read_text())["tag"] == tag:
+                      selected = path
+                      break
+              if selected is None:
+                  output = root / ("migration-" + tag)
+                  subprocess.run([sys.executable, ".github/scripts/verify_release.py", "--tag", tag,
+                                  "--evidence-dir", str(output)], check=True)
+                  selected = output / "verification.json"
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                  stream.write(f"{key}={selected}\n")
+          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 0merUfuk/skuggsja
@@ -127,6 +159,8 @@ jobs:
           LIFECYCLE_MODE: ${{ github.event_name == 'pull_request' && 'candidate' || 'public' }}
           EXPECTED_PLATFORM: ${{ matrix.platform }}
           EXPECTED_ARCH: ${{ matrix.arch }}
+          MIGRATION_V010: ${{ steps.migration.outputs.v010 }}
+          MIGRATION_V011: ${{ steps.migration.outputs.v011 }}
         run: |
           python3 .github/scripts/lifecycle.py \
             --checkout "$GITHUB_WORKSPACE" --expected-head "$EXPECTED_HEAD" \
@@ -135,7 +169,8 @@ jobs:
             --source "$GITHUB_WORKSPACE/verified-source" \
             --baseline-source "$GITHUB_WORKSPACE/baseline-source" \
             --evidence-dir "$RUNNER_TEMP/lifecycle" --mode "$LIFECYCLE_MODE" \
-            --platform "$EXPECTED_PLATFORM" --arch "$EXPECTED_ARCH"
+            --platform "$EXPECTED_PLATFORM" --arch "$EXPECTED_ARCH" \
+            --verify-migration --migration-v010 "$MIGRATION_V010" --migration-v011 "$MIGRATION_V011"
       - name: Retain synthetic lifecycle and provenance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -147,5 +182,6 @@ jobs:
             ${{ runner.temp }}/lifecycle/*.stderr
             ${{ runner.temp }}/candidate/verification.json
             ${{ runner.temp }}/baseline/verification.json
+            ${{ runner.temp }}/migration-v*/verification.json
           if-no-files-found: warn
           retention-days: 14

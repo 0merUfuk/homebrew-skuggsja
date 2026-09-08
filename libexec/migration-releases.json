@@ -1,0 +1,80 @@
+{
+  "repository": "0merUfuk/skuggsja",
+  "legacy_tap": "0merufuk/thematrix",
+  "destination_tap": "0merufuk/skuggsja",
+  "releases": [
+    {
+      "version": "0.1.0",
+      "os": "darwin",
+      "arch": "arm64",
+      "source_sha": "4bd47168e7e5faacbada3266991a58ac95db9dd0",
+      "archive": "skuggsja_0.1.0_darwin_arm64.tar.gz",
+      "archive_sha256": "6fcf0b6805990deacd0e0b9990d054966c562d1c002cf5176848d45c6c3aa152",
+      "binary_sha256": "971b2cb0dc99c194fe19746e2784fa84916331238405f593ebeb6c5f706a5481"
+    },
+    {
+      "version": "0.1.0",
+      "os": "darwin",
+      "arch": "amd64",
+      "source_sha": "4bd47168e7e5faacbada3266991a58ac95db9dd0",
+      "archive": "skuggsja_0.1.0_darwin_amd64.tar.gz",
+      "archive_sha256": "b1391212f37a3afd40373f2cd3aaab13025e145a9da24a56a3f333c59169dfcc",
+      "binary_sha256": "18ad3b93f4ea355a9c3dd174060ed44c4450f8eb4f8504042e57f52a4cbae327"
+    },
+    {
+      "version": "0.1.0",
+      "os": "linux",
+      "arch": "arm64",
+      "source_sha": "4bd47168e7e5faacbada3266991a58ac95db9dd0",
+      "archive": "skuggsja_0.1.0_linux_arm64.tar.gz",
+      "archive_sha256": "388c7553e1894d544c5edaddc86b585cd34a6e6a7c36898de5a04388da8fc5e8",
+      "binary_sha256": "3c55d1ecebaf2eac6696ddde354c5d0c733ffab4702834bf94b9834e225663c3"
+    },
+    {
+      "version": "0.1.0",
+      "os": "linux",
+      "arch": "amd64",
+      "source_sha": "4bd47168e7e5faacbada3266991a58ac95db9dd0",
+      "archive": "skuggsja_0.1.0_linux_amd64.tar.gz",
+      "archive_sha256": "3528bfce2ef2f717bd887d1d419c2941761f18683c308bd4099dd5cd63ecb808",
+      "binary_sha256": "62475bd22df7ec0f9f103932781a6831a87924ad1936ea6610ad75a33e600bea"
+    },
+    {
+      "version": "0.1.1",
+      "os": "darwin",
+      "arch": "arm64",
+      "source_sha": "b50703df997d3ffb297715a9af0c8a226bea3e46",
+      "archive": "skuggsja_0.1.1_darwin_arm64.tar.gz",
+      "archive_sha256": "4560a2eb42af8fe04b01899f2833e3b5dda5a1fe74943af2537562b32e0755b7",
+      "binary_sha256": "cbc687e994700faa81ee225735b5e57db526177856150195edac2c42d5d20ecf"
+    },
+    {
+      "version": "0.1.1",
+      "os": "darwin",
+      "arch": "amd64",
+      "source_sha": "b50703df997d3ffb297715a9af0c8a226bea3e46",
+      "archive": "skuggsja_0.1.1_darwin_amd64.tar.gz",
+      "archive_sha256": "3079113535c1f5e05e868ebf837a57c5dca703f08f178d90c627edb8735bf87a",
+      "binary_sha256": "0c3e0770342ada3c809bc278f6401e13c28b2093202b2df77c573e495cd53422"
+    },
+    {
+      "version": "0.1.1",
+      "os": "linux",
+      "arch": "arm64",
+      "source_sha": "b50703df997d3ffb297715a9af0c8a226bea3e46",
+      "archive": "skuggsja_0.1.1_linux_arm64.tar.gz",
+      "archive_sha256": "2fab4bc62a6f426c9bbebc185b012c9b8ef6a71fdaa266ea6a6f8c9c8f1e2b57",
+      "binary_sha256": "b6a8f222ca47fa24f73f4cbd7f790b81b991e13aa39e935352adffbcb9e050d8"
+    },
+    {
+      "version": "0.1.1",
+      "os": "linux",
+      "arch": "amd64",
+      "source_sha": "b50703df997d3ffb297715a9af0c8a226bea3e46",
+      "archive": "skuggsja_0.1.1_linux_amd64.tar.gz",
+      "archive_sha256": "79300a2b081c94c41d90b93f3437cf9420d9096cf0ab31e6833810bcfb436610",
+      "binary_sha256": "76fa69fccf19ef56596215a9f28be101fe7b0f56b465cedc4fd51eca22fee2c0"
+    }
+  ],
+  "evidence": "All input archives verified against exact source-tag GitHub build provenance before deriving these hashes. Receipt migration does not replace executables."
+}

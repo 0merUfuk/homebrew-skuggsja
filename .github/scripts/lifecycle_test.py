@@ -11,7 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from lifecycle import Lifecycle, inspect_receipts, load_release, native_archive, stable_version
+from lifecycle import (Lifecycle, inspect_receipts, load_release, native_archive, stable_version,
+                       migration_snapshot, require_tap_only_change)
 
 
 class LifecycleGuards(unittest.TestCase):
@@ -179,6 +180,56 @@ class LifecycleGuards(unittest.TestCase):
             check = Lifecycle(args)
         self.assertFalse(set(env) & {"GH_TOKEN", "GITHUB_TOKEN", "HOMEBREW_GITHUB_API_TOKEN"} & set(check.env))
         self.assertEqual(Path(check.env["HOMEBREW_USER_CONFIG_HOME"]).parent, args.evidence_dir.resolve())
+
+    def migration_pair(self):
+        cellar = self.root / "Cellar"
+        for version in ("0.1.0", "0.1.1"):
+            keg = cellar / "skuggsja" / version
+            (keg / "bin").mkdir(parents=True)
+            (keg / "bin/skuggsja").write_text("synthetic executable " + version)
+            (keg / "INSTALL_RECEIPT.json").write_text(json.dumps({"source": {"tap": "0merufuk/thematrix", "path": "synthetic/formula.rb"}, "options": ["synthetic-option"]}))
+        pin = self.root / "var/homebrew/pinned/skuggsja"
+        pin.parent.mkdir(parents=True)
+        pin.symlink_to(cellar / "skuggsja/0.1.1")
+        before = migration_snapshot(self.root, cellar)
+        after = json.loads(json.dumps(before))
+        for entry in after["receipts"].values():
+            entry["data"]["source"]["tap"] = "0merufuk/skuggsja"
+            entry["sha256"] = "new-receipt-bytes"
+            entry["mtime_ns"] += 1
+        return before, after
+
+    def test_migration_allows_only_actual_origin_change_for_both_retained_kegs(self):
+        before, after = self.migration_pair()
+        require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_rewriting_other_receipt_metadata(self):
+        before, after = self.migration_pair()
+        after["receipts"]["0.1.0"]["data"]["source"]["path"] = "different/formula.rb"
+        with self.assertRaisesRegex(ValueError, "semantics"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_missing_retained_keg(self):
+        before, after = self.migration_pair()
+        del after["receipts"]["0.1.0"]
+        with self.assertRaisesRegex(ValueError, "every original keg"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_changed_receipt_permissions(self):
+        before, after = self.migration_pair()
+        after["receipts"]["0.1.0"]["mode"] = before["receipts"]["0.1.0"]["mode"] ^ 0o100
+        with self.assertRaisesRegex(ValueError, "receipt permissions"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+
+    def test_migration_rejects_binary_or_pin_mutation(self):
+        before, after = self.migration_pair()
+        after["files"]["0.1.0/bin/skuggsja"]["mtime_ns"] += 1
+        with self.assertRaisesRegex(ValueError, "non-receipt"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
+        after["files"] = json.loads(json.dumps(before["files"]))
+        after["links"]["var/homebrew/pinned/skuggsja"]["target"] = "other-keg"
+        with self.assertRaisesRegex(ValueError, "non-receipt"):
+            require_tap_only_change(before, after, ["0.1.0", "0.1.1"])
 
 
 if __name__ == "__main__":

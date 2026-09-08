@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Stable upstream tag (vMAJOR.MINOR.PATCH); empty selects latest stable"
+        description: "Stable upstream tag on main (empty selects latest); leave empty on maintenance branches"
         required: false
         type: string
 
@@ -59,3 +59,88 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_MAIN: ${{ github.sha }}
         run: python3 .github/scripts/propose_update.py --manifest "$RUNNER_TEMP/update/verification.json" --expected-main "$EXPECTED_MAIN"
+
+  maintenance:
+    name: Propose tap maintenance
+    if: github.repository == '0merUfuk/homebrew-skuggsja' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # A bot-authored PR permits normal owner review with enforce_admins enabled.
+      # No checkout or execution of repository scripts, formulas or installed binaries.
+      - name: Open or reuse a maintenance pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag || '' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from urllib.parse import quote, urlencode
+
+          repository = "0merUfuk/homebrew-skuggsja"
+          ref = os.environ.get("GITHUB_REF", "")
+          head = os.environ.get("GITHUB_SHA", "")
+          if os.environ.get("GITHUB_REPOSITORY") != repository or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+              raise SystemExit("Maintenance proposals require this tap's explicit workflow dispatch")
+          if os.environ.get("REQUESTED_TAG", ""):
+              raise SystemExit("Leave tag empty for maintenance; stable formula imports run from main")
+          if not ref.startswith("refs/heads/") or ref == "refs/heads/main":
+              raise SystemExit("Maintenance proposals require a non-main branch")
+          branch = ref.removeprefix("refs/heads/")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or not re.fullmatch(r"[0-9a-f]{40}", head):
+              raise SystemExit("Expected a safe branch name and the exact dispatched commit")
+
+          def api(method, endpoint, payload=None):
+              command = ["gh", "api", "--hostname", "github.com", "--method", method, f"repos/{repository}/{endpoint}"]
+              if payload is not None:
+                  command += ["--input", "-"]
+              result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                                      text=True, capture_output=True, check=True, timeout=45,
+                                      env={**os.environ, "GH_HOST": "github.com"})
+              return json.loads(result.stdout)
+
+          def verify_head():
+              current = api("GET", "git/ref/heads/" + quote(branch, safe="/"))
+              if current.get("ref") != ref or current.get("object", {}).get("type") != "commit" or current["object"].get("sha") != head:
+                  raise SystemExit("Branch advanced since dispatch; dispatch its current head again")
+
+          def verify_pr(pr):
+              source = pr.get("head", {})
+              target = pr.get("base", {})
+              if (pr.get("state") != "open" or source.get("ref") != branch or source.get("sha") != head
+                      or source.get("repo", {}).get("full_name") != repository
+                      or target.get("ref") != "main" or target.get("repo", {}).get("full_name") != repository):
+                  raise SystemExit("Pull request does not match this repository's dispatched branch and main")
+
+          verify_head()
+          query = urlencode({"state": "open", "head": "0merUfuk:" + branch, "base": "main", "per_page": 100})
+          matches = api("GET", "pulls?" + query)
+          if not isinstance(matches, list) or len(matches) > 1:
+              raise SystemExit("Expected at most one open maintenance PR for this branch")
+          verify_head()
+          if matches:
+              pr = matches[0]
+              status = "maintenance_pr_reused"
+          else:
+              pr = api("POST", "pulls", {
+                  "title": "chore: review tap maintenance (" + branch + ")",
+                  "head": branch,
+                  "base": "main",
+                  "body": "Propose the maintenance branch at `" + head + "` for normal owner review.\n\n"
+                          "The bot opens this PR so the owner can review it without an administrator bypass. "
+                          "This proposal job does not check out candidate files, evaluate formulas, execute installed binaries, write commits, approve, or merge.\n\n"
+                          "Approve workflows to run if GitHub requests it. All required CI must pass, then the owner must review "
+                          "the exact current PR head before merging. Workflow-run approval is not publication approval; "
+                          "new commits require fresh checks and review."
+              })
+              status = "maintenance_pr_open"
+          verify_pr(pr)
+          verify_head()
+          print(json.dumps({"status": status, "head": head, "url": pr["html_url"]}))
+          PY

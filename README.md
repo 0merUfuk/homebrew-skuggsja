@@ -43,23 +43,54 @@ network; Skuggsja's runtime remains local with no outbound requests.
 
 ## Moving from The Matrix tap
 
-The formula and executable keep the same name. Existing installations do not
-need to be uninstalled, and users of Matrix tools should retain their Matrix tap.
-Homebrew can update installation receipts through the old tap's migration entry.
-If the destination is not yet trusted or the receipt remains on the old tap:
+Keep The Matrix tap for its other tools. Prepare the new destination before
+Homebrew processes the migration:
 
 ```sh
-brew update
 brew trust --formula 0merUfuk/skuggsja/skuggsja
 brew tap 0merUfuk/skuggsja
-brew reinstall 0merUfuk/skuggsja/skuggsja
-brew info --json=v2 0merUfuk/skuggsja/skuggsja
+brew update
 ```
 
-The `brew trust` command applies to current Homebrew versions with explicit tap
-trust. Honor the installed Homebrew version's trust instructions. Reinstall
-replaces the keg while retaining application data; it is not a package rename.
-Pinned installations should remain pinned unless their owner chooses to upgrade.
+Check every installed receipt, including retained older kegs:
+
+```sh
+for receipt in "$(brew --cellar skuggsja)"/*/INSTALL_RECEIPT.json; do
+  printf '%s\n' "$receipt"
+  cat "$receipt"
+done
+```
+
+Automatic migration changes each receipt's `source.tap` to `0merufuk/skuggsja`
+without replacing binaries or clearing pins. If an earlier update processed the
+move before the destination was trusted, another update may have nothing to
+replay. Qualified reinstall alone can retain the old receipt on current Homebrew.
+
+For that case, use the dedicated receipt-recovery command:
+
+```sh
+brew trust --command 0merUfuk/skuggsja/skuggsja-migrate
+HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_NO_ANALYTICS=1 \
+  brew skuggsja-migrate --check
+HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_NO_ANALYTICS=1 \
+  brew skuggsja-migrate --apply
+```
+
+The environment flags suppress Homebrew startup updates, API refresh and analytics
+for this offline recovery invocation. This one-time Homebrew command verifies
+the original released executables before
+changing only the old Matrix receipt's tap association. It preserves retained
+kegs, binaries, completions and pins, backs up the original receipts, and refuses
+unknown legacy binaries or concurrent Homebrew changes. It does not uninstall
+Skuggsja, change application reports, read harness histories or make network
+requests. Its writes are confined to Homebrew metadata and receipt backups;
+the Skuggsja application remains read-only on source paths.
+
+The command supports the v0.1.0 and v0.1.1 binaries distributed by the former tap.
+A check leaves receipts and installed files unchanged; `--apply` is explicit
+and safe to repeat after success.
+Inspect the reported counts before considering all retained kegs migrated.
+Normal future updates use `brew upgrade 0merUfuk/skuggsja/skuggsja`.
 
 ## Release updates
 
@@ -85,6 +116,17 @@ place if a candidate fails.
 Bot-created PRs may require a maintainer to select **Approve workflows to run**.
 The maintainer then reviews and merges the exact tested candidate. Formula
 preparation is automated; approval and publication are deliberate gates.
+
+For tap maintenance, push a review branch, then request a bot-authored PR using
+this same workflow with an empty tag:
+
+```sh
+gh workflow run update-skuggsja.yml --repo 0merUfuk/homebrew-skuggsja \
+  --ref YOUR_REVIEW_BRANCH
+```
+
+The job checks the dispatched branch head and opens or reuses its PR. It does not
+approve or merge it; the same checks and review requirements apply.
 
 Report packaging failures in this tap's issues. For application behavior, source
 coverage and privacy details, use the
