@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Generated from the release checksums; do not edit download values manually.
-# Skuggsja release version: 0.1.2
+# Skuggsja release version: 0.2.0
 class Skuggsja < Formula
   desc "Local history retrospective for AI coding agents"
   homepage "https://github.com/0merUfuk/skuggsja"
@@ -9,23 +9,23 @@ class Skuggsja < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.1.2/skuggsja_0.1.2_darwin_arm64.tar.gz"
-      sha256 "e33a5bc92d7e4ea26f8a428af2686b9a6e32ed3c80c3f63c6a2aff7f5e83c3e6"
+      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.2.0/skuggsja_0.2.0_darwin_arm64.tar.gz"
+      sha256 "4f59f493e2dbe3a837c695f4137b4492ef9d65fa5c4b663c532d818f83e1528c"
     end
     on_intel do
-      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.1.2/skuggsja_0.1.2_darwin_amd64.tar.gz"
-      sha256 "597936e70f8f6ce8920b5c3d80fb003ae49ceffb72d076e22575e3615a3c7ebe"
+      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.2.0/skuggsja_0.2.0_darwin_amd64.tar.gz"
+      sha256 "4943a6f1a628f886c072f3a2fb2c757ff2fc913093b0d57138520cd2bcc2ad1a"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.1.2/skuggsja_0.1.2_linux_arm64.tar.gz"
-      sha256 "566d2096e20d1e13ff5b4aafa1b3cb79cdb31e94ba9b4631f38675357fc65f5a"
+      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.2.0/skuggsja_0.2.0_linux_arm64.tar.gz"
+      sha256 "b37e897a199517c81d81b76852bd2f8d35c110a2253dfadbaab292c40febeeb2"
     end
     on_intel do
-      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.1.2/skuggsja_0.1.2_linux_amd64.tar.gz"
-      sha256 "f29df983315b3e966b57ba4828c3a9637ad4cde881a2e6b16e9a489d49fc36a0"
+      url "https://github.com/0merUfuk/skuggsja/releases/download/v0.2.0/skuggsja_0.2.0_linux_amd64.tar.gz"
+      sha256 "a8b5ff53563ccd531f45919d20882a9a38848442ac8c581cb0f84ad753e8f5ea"
     end
   end
 
